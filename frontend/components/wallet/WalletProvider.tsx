@@ -41,6 +41,11 @@ const WalletContext = createContext<WalletContextValue | null>(null);
 
 const STORAGE_KEY = 'vouch.wallet.rdns';
 
+const GENLAYER_CHAIN_ID = '0xf22f'; // 61999 — GenLayer Studionet
+const GENLAYER_CHAIN_NAME = 'Genlayer Studio Network';
+const GENLAYER_RPC_URL = 'https://studio.genlayer.com/api';
+const GENLAYER_SYMBOL = 'GEN';
+
 export function useWallet(): WalletContextValue {
   const ctx = useContext(WalletContext);
   if (!ctx) throw new Error('useWallet must be used inside <WalletProvider>');
@@ -55,11 +60,43 @@ function shortAddress(addr: string): string {
 
 export function formatChain(chainId: string | null): string {
   if (!chainId) return '';
+  if (chainId === GENLAYER_CHAIN_ID) return 'GenLayer Testnet';
   const dec = parseInt(chainId, 16);
   if (dec === 1) return 'Ethereum';
   if (dec === 11155111) return 'Sepolia';
   return `Chain ${dec}`;
 }
+
+/** Make sure the wallet is pointed at the GenLayer chain before any read or write. */
+const ensureGenLayerChain = async (provider: EIP1193Provider): Promise<boolean> => {
+  try {
+    const cid = await provider.request({ method: 'eth_chainId' });
+    if (String(cid) === GENLAYER_CHAIN_ID) return true;
+    try {
+      await provider.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: GENLAYER_CHAIN_ID }] });
+      return true;
+    } catch (switchErr) {
+      const err = switchErr as { code?: number };
+      if (err?.code === 4902) {
+        await provider.request({
+          method: 'wallet_addEthereumChain',
+          params: [
+            {
+              chainId: GENLAYER_CHAIN_ID,
+              chainName: GENLAYER_CHAIN_NAME,
+              rpcUrls: [GENLAYER_RPC_URL],
+              nativeCurrency: { name: 'GEN', symbol: GENLAYER_SYMBOL, decimals: 18 },
+            },
+          ],
+        });
+        await provider.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: GENLAYER_CHAIN_ID }] });
+      }
+      return false;
+    }
+  } catch {
+    return false;
+  }
+};
 
 /** Legacy fallback: wallets without EIP-6963 only expose window.ethereum. */
 function legacyProvider(): AnnouncedProvider | null {
@@ -148,16 +185,19 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     let cancelled = false;
     entry.provider
       .request({ method: 'eth_accounts' })
-      .then((accounts) => {
+      .then(async (accounts) => {
         if (cancelled) return;
         const list = accounts as string[];
         if (list && list.length > 0) {
           setAccount(list[0]);
           attachListeners(entry.provider);
-          entry.provider
-            .request({ method: 'eth_chainId' })
-            .then((cid) => !cancelled && setChainId(String(cid)))
-            .catch(() => {});
+          const cid = await entry.provider.request({ method: 'eth_chainId' });
+          if (!cancelled) setChainId(String(cid));
+          const onChain = await ensureGenLayerChain(entry.provider);
+          if (onChain && !cancelled) {
+            const cidAfter = await entry.provider.request({ method: 'eth_chainId' });
+            if (!cancelled) setChainId(String(cidAfter));
+          }
         } else {
           localStorage.removeItem(STORAGE_KEY);
         }
@@ -184,6 +224,11 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
         setAccount(accounts[0]);
         const cid = (await entry.provider.request({ method: 'eth_chainId' })) as string;
         setChainId(cid);
+        const onChain = await ensureGenLayerChain(entry.provider);
+        if (onChain) {
+          const cidAfter = (await entry.provider.request({ method: 'eth_chainId' })) as string;
+          setChainId(String(cidAfter));
+        }
         attachListeners(entry.provider);
         localStorage.setItem(STORAGE_KEY, rdns);
         setModalOpen(false);
