@@ -431,3 +431,175 @@ def test_assess_prompt_uses_gen_units_and_onchain_reputation(direct_vm, direct_d
     assert "reputation 750" in prompt, prompt
     assert "status active" in prompt, prompt
     assert borrower in prompt, prompt
+
+
+# ------------------------------------------------------------------ #
+# Full public-API coverage: bulk views, sender views, disbursement
+# ------------------------------------------------------------------ #
+
+
+def test_get_loan_count_tracks_creations(direct_vm, direct_deploy, direct_alice):
+    """get_loan_count starts at zero and increments with every created loan."""
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+
+    assert contract.get_loan_count() == {"count": 0}
+
+    contract.create_borrower("0x1234", 100)
+    contract.create_loan("0x1234", 1000, 500)
+    contract.create_loan("0x1234", 2000, 750)
+    contract.create_loan("0x1234", 3000, 1000)
+
+    assert contract.get_loan_count() == {"count": 3}
+
+
+def test_get_loans_returns_all_records(direct_vm, direct_deploy, direct_alice):
+    """get_loans exposes every loan with escrow accounting, keyed by loan id."""
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+    contract.create_borrower("0x1234", 100)
+    contract.create_loan("0x1234", 1000, 500)
+    contract.create_loan("0x5678", 2000, 750)
+
+    loans = contract.get_loans()
+    assert set(loans) == {"loan_0", "loan_1"}, loans
+
+    first = loans["loan_0"]
+    assert first["id"] == "loan_0"
+    assert first["borrower"] == "0x1234"
+    assert first["amount"] == 1000
+    assert first["interest_rate"] == 500
+    assert first["status"] == "pending"
+    assert first["deposited"] == 0
+    assert first["created_at"] and first["due_date"]
+
+    second = loans["loan_1"]
+    assert second["borrower"] == "0x5678"
+    assert second["amount"] == 2000
+    assert second["interest_rate"] == 750
+
+
+def test_get_borrower_by_sender(direct_vm, direct_deploy, direct_alice, direct_bob):
+    """The sender-scoped view resolves the caller profile (unknown until registered)."""
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+
+    # unknown caller: id echoes the sender, no profile
+    direct_vm.sender = direct_alice
+    unknown = contract.get_borrower_by_sender()
+    assert unknown["status"] == "unknown"
+    assert unknown["id"] == contract._sender()
+
+    # register the caller and the view must reflect it immediately
+    contract.create_borrower(contract._sender(), 700)
+    profile = contract.get_borrower_by_sender()
+    assert profile["status"] == "active"
+    assert profile["reputation"] == 700
+    assert profile["total_borrowed"] == 0
+    assert profile["total_repaid"] == 0
+
+    # a different sender still sees their own (unknown) profile
+    direct_vm.sender = direct_bob
+    other = contract.get_borrower_by_sender()
+    assert other["status"] == "unknown"
+    assert other["id"] != profile["id"]
+
+
+def test_get_credit_assessments_bulk(direct_vm, direct_deploy, direct_alice):
+    """The bulk decision view is empty before consensus and keyed by borrower after."""
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+    borrower = contract._sender()
+    contract.create_borrower(borrower, 750)
+
+    # no loans -> no decisions to surface
+    assert contract.get_credit_assessments() == {}
+
+    contract.create_loan(borrower, 1000, 500)
+    # decision exists in storage but has no consensus verdict yet
+    assert contract.get_credit_assessment(borrower) == ""
+
+    direct_vm.mock_llm(r".*risk validator.*", '{"approved": true, "risk_score": 42}')
+    contract.assess_credit(borrower, 1000)
+
+    decisions = contract.get_credit_assessments()
+    assert list(decisions) == [borrower], decisions
+    parsed = json.loads(decisions[borrower])
+    assert parsed["approved"] is True
+    assert parsed["risk_score"] == 25  # deterministic: 100 - 750//10
+    assert parsed["borrower"] == borrower
+    assert parsed["amount"] == 1000
+
+    # borrowers without a loan never appear in the bulk view
+    contract.create_borrower("0x" + "cd" * 20, 900)
+    assert "0x" + "cd" * 20 not in contract.get_credit_assessments()
+
+
+def test_disburse_loan_lifecycle(direct_vm, direct_deploy, direct_alice):
+    """Happy path: assess -> fund -> disburse moves the loan to active with escrow held."""
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+    borrower = contract._sender()
+    contract.create_borrower(borrower, 800)
+    loan_id = contract.create_loan(borrower, 1000, 500)
+    direct_vm.mock_llm(r".*risk validator.*", '{"approved": true, "risk_score": 5}')
+    contract.assess_credit(borrower, 1000)
+
+    direct_vm.value = 1000
+    assert str(contract.fund_loan(loan_id, 1000)) == "FUNDED"
+    loan = contract.get_loan(loan_id)
+    assert loan["status"] == "funded"
+    assert loan["deposited"] == 1000
+
+    direct_vm.value = 0
+    assert str(contract.disburse_loan(loan_id, 1000)) == "DISBURSED"
+    loan = contract.get_loan(loan_id)
+    assert loan["status"] == "active"
+    assert loan["deposited"] == 1000  # escrow accounting stays auditable
+
+    # the bulk view reflects the disbursed state for the app
+    loans = contract.get_loans()
+    assert loans[loan_id]["status"] == "active"
+    assert loans[loan_id]["deposited"] == 1000
+
+
+# ------------------------------------------------------------------ #
+# Steward critique: the consensus verdict must actually drive lending
+# ------------------------------------------------------------------ #
+
+
+def test_consensus_verdict_is_the_lending_switch(direct_vm, direct_deploy, direct_alice):
+    """A rejected quorum verdict blocks escrow; re-assessing to approved unlocks it.
+
+    This is the GenLayer steward's core requirement: a non-deterministic
+    consensus round whose outcome — not the raw call — decides whether capital
+    can be locked, and the app can read that outcome back from storage.
+    """
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+    borrower = contract._sender()
+    contract.create_borrower(borrower, 300)
+    loan_id = contract.create_loan(borrower, 1000, 500)
+
+    # 1) quorum rejects -> funding refused, no escrow moved
+    direct_vm.mock_llm(r".*risk validator.*", '{"approved": false}')
+    decision = contract.assess_credit(borrower, 1000)
+    assert json.loads(decision)["approved"] is False
+    direct_vm.value = 1000
+    with pytest.raises(Exception) as excinfo:
+        contract.fund_loan(loan_id, 1000)
+    _assert_user_error(excinfo.value, "CREDIT_REJECTED")
+    assert contract.get_loan(loan_id)["status"] == "pending"
+    assert contract.get_loan(loan_id)["deposited"] == 0
+
+    # 2) quorum approves on reassessment -> the same call now succeeds
+    direct_vm.clear_mocks()  # first-match-wins: drop the rejected verdict mock
+    direct_vm.mock_llm(r".*risk validator.*", '{"approved": true}')
+    decision = contract.assess_credit(borrower, 1000)
+    assert json.loads(decision)["approved"] is True
+    assert str(contract.fund_loan(loan_id, 1000)) == "FUNDED"
+    assert contract.get_loan(loan_id)["status"] == "funded"
+
+    # 3) the settled verdict is readable by the frontend through both getters
+    parsed = json.loads(contract.get_credit_assessment(borrower))
+    assert parsed["approved"] is True
+    assert borrower in contract.get_credit_assessments()
