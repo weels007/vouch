@@ -1,7 +1,13 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { getBorrowerBySender, getLoans, getLoanCount } from '@/lib/genlayer';
+import {
+  getBorrowerBySender,
+  getCreditAssessmentFor,
+  getLoanCount,
+  getLoans,
+  type CreditDecision,
+} from '@/lib/genlayer';
 import { useWallet } from '@/components/wallet/WalletProvider';
 import WalletGate from '@/components/wallet/WalletGate';
 import LoanActions from '@/components/LoanActions';
@@ -30,6 +36,7 @@ export default function Dashboard() {
   const [profile, setProfile] = useState<Profile | null>(null);
   const [loans, setLoans] = useState<Record<string, LoanRecord>>({});
   const [loanCount, setLoanCount] = useState(0);
+  const [decision, setDecision] = useState<CreditDecision | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -38,6 +45,7 @@ export default function Dashboard() {
       setProfile(null);
       setLoans({});
       setLoanCount(0);
+      setDecision(null);
       setError(null);
       return;
     }
@@ -62,9 +70,11 @@ export default function Dashboard() {
           }
           setLoans(mine);
         }
+        return getCreditAssessmentFor(account);
       })
-      .then(() => {
+      .then((d) => {
         if (cancelled) return;
+        setDecision(d ?? null);
         return getLoanCount();
       })
       .then((c) => {
@@ -152,6 +162,47 @@ export default function Dashboard() {
 
         {/* Live, consensus-settled protocol actions */}
         <LoanActions />
+
+        {/* Validator consensus decision — stored on-chain by assess_credit */}
+        <div className="border border-line rounded-lg bg-ink p-7 mb-10">
+          <div className="flex flex-wrap items-start justify-between gap-6">
+            <div className="max-w-2xl">
+              <span className="eyebrow">Validator consensus</span>
+              <h2 className="font-display text-xl text-bone mt-3">Credit decision on record</h2>
+              <p className="text-sm text-sage mt-2 leading-relaxed">
+                Settled by the leader and validator quorum through comparative LLM consensus, then
+                written to contract storage. <span className="text-bone">fund_loan refuses to lock
+                escrow until this verdict exists and reads approved.</span>
+              </p>
+            </div>
+            <div className="text-right">
+              {loading && !decision ? (
+                <div className="font-mono text-[12px] text-sage/60">Reading decision…</div>
+              ) : !decision ? (
+                <>
+                  <div className="font-display text-2xl text-sage">Not assessed</div>
+                  <div className="font-mono text-[11px] text-sage/60 mt-1">
+                    no settled quorum decision yet
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div
+                    className={`font-display text-2xl ${
+                      decision.approved ? 'text-verdigris' : 'text-stamp'
+                    }`}
+                  >
+                    {decision.approved ? 'Approved' : 'Rejected'}
+                  </div>
+                  <div className="font-mono text-[11px] text-sage mt-1">
+                    risk score {decision.risk_score ?? '—'}/100 ·{' '}
+                    {Number(decision.amount ?? 0).toLocaleString()} GEN
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
 
         {/* Loans — live from the contract */}
         <div className="border border-line rounded-lg overflow-hidden">

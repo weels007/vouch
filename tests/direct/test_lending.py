@@ -1,5 +1,7 @@
 """Direct mode tests for UnderCollaterizedLending contract."""
 
+import json
+
 import pytest
 
 
@@ -148,3 +150,284 @@ def test_loan_id_increment(direct_vm, direct_deploy, direct_alice):
     assert loan_id_1 == "loan_0"
     assert loan_id_2 == "loan_1"
     assert loan_id_3 == "loan_2"
+
+
+# ------------------------------------------------------------------ #
+# Adversarial: consensus-gated credit & revert paths
+# ------------------------------------------------------------------ #
+
+
+def _assert_user_error(exc: Exception, code: str) -> None:
+    """Assert that a raised exception carries the expected UserError code."""
+    assert code in str(exc), f"expected error code {code!r}, got {exc!r}"
+
+
+def test_fund_loan_without_credit_assessment_reverts(direct_vm, direct_deploy, direct_alice):
+    """Funding must be impossible before any validator consensus ran."""
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+    borrower = contract._sender()
+    contract.create_borrower(borrower, 100)
+    loan_id = contract.create_loan(borrower, 1000, 500)
+
+    with pytest.raises(Exception) as excinfo:
+        contract.fund_loan(loan_id, 1000)
+    _assert_user_error(excinfo.value, "CREDIT_NOT_ASSESSED")
+
+
+def test_fund_loan_after_rejected_consensus_reverts(direct_vm, direct_deploy, direct_alice):
+    """An approved=false consensus verdict must permanently block funding."""
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+    borrower = contract._sender()
+    contract.create_borrower(borrower, 100)
+    loan_id = contract.create_loan(borrower, 1000, 500)
+    direct_vm.mock_llm(r".*risk validator.*", '{"approved": false, "risk_score": 95}')
+
+    decision = contract.assess_credit(borrower, 1000)
+    assert '"approved": false' in str(decision)
+
+    with pytest.raises(Exception) as excinfo:
+        contract.fund_loan(loan_id, 1000)
+    _assert_user_error(excinfo.value, "CREDIT_REJECTED")
+
+
+def test_fund_loan_after_approved_consensus_succeeds(direct_vm, direct_deploy, direct_alice):
+    """A final approved consensus verdict must unlock escrow funding."""
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+    borrower = contract._sender()
+    contract.create_borrower(borrower, 100)
+    loan_id = contract.create_loan(borrower, 1000, 500)
+    direct_vm.mock_llm(r".*risk validator.*", '{"approved": true, "risk_score": 5}')
+
+    decision = contract.assess_credit(borrower, 1000)
+    assert '"approved": true' in str(decision)
+
+    direct_vm.value = 1000
+    result = contract.fund_loan(loan_id, 1000)
+    assert str(result) == "FUNDED"
+    assert str(contract.get_loan(loan_id)["status"]) == "funded"
+
+
+def test_fund_loan_by_non_borrower_reverts(direct_vm, direct_deploy, direct_bob, direct_alice):
+    """Only the borrower itself may fund its own loan."""
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_bob
+    borrower = contract._sender()
+    contract.create_borrower(borrower, 100)
+    loan_id = contract.create_loan(borrower, 1000, 500)
+
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception) as excinfo:
+        contract.fund_loan(loan_id, 1000)
+    _assert_user_error(excinfo.value, "NOT_BORROWER")
+
+
+def test_fund_loan_unknown_loan_reverts(direct_vm, direct_deploy, direct_alice):
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception) as excinfo:
+        contract.fund_loan("loan_9999", 1000)
+    _assert_user_error(excinfo.value, "LOAN_NOT_FOUND")
+
+
+def test_fund_loan_zero_amount_reverts(direct_vm, direct_deploy, direct_alice):
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+    borrower = contract._sender()
+    contract.create_borrower(borrower, 100)
+    loan_id = contract.create_loan(borrower, 1000, 500)
+    with pytest.raises(Exception) as excinfo:
+        contract.fund_loan(loan_id, 0)
+    _assert_user_error(excinfo.value, "ZERO_FUNDING")
+
+
+def test_fund_loan_wrong_value_reverts(direct_vm, direct_deploy, direct_alice):
+    """Escrow must be funded with exactly the assessed amount."""
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+    borrower = contract._sender()
+    contract.create_borrower(borrower, 100)
+    loan_id = contract.create_loan(borrower, 1000, 500)
+    direct_vm.mock_llm(r".*risk validator.*", '{"approved": true, "risk_score": 5}')
+    contract.assess_credit(borrower, 1000)
+    with pytest.raises(Exception) as excinfo:
+        contract.fund_loan(loan_id, 1000)
+    _assert_user_error(excinfo.value, "WRONG_VALUE")
+
+
+def test_fund_loan_twice_reverts(direct_vm, direct_deploy, direct_alice):
+    """A funded loan can no longer accept a second funding."""
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+    borrower = contract._sender()
+    contract.create_borrower(borrower, 100)
+    loan_id = contract.create_loan(borrower, 1000, 500)
+    direct_vm.mock_llm(r".*risk validator.*", '{"approved": true, "risk_score": 5}')
+    contract.assess_credit(borrower, 1000)
+    direct_vm.value = 1000
+    assert str(contract.fund_loan(loan_id, 1000)) == "FUNDED"
+    with pytest.raises(Exception) as excinfo:
+        contract.fund_loan(loan_id, 1000)
+    _assert_user_error(excinfo.value, "LOAN_NOT_FUNDABLE")
+
+
+def test_disburse_loan_requires_funded_status(direct_vm, direct_deploy, direct_alice):
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+    borrower = contract._sender()
+    contract.create_borrower(borrower, 100)
+    loan_id = contract.create_loan(borrower, 1000, 500)
+    with pytest.raises(Exception) as excinfo:
+        contract.disburse_loan(loan_id, 1000)
+    _assert_user_error(excinfo.value, "LOAN_NOT_FUNDED")
+
+
+def test_disburse_loan_zero_amount_reverts(direct_vm, direct_deploy, direct_alice):
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+    borrower = contract._sender()
+    contract.create_borrower(borrower, 100)
+    loan_id = contract.create_loan(borrower, 1000, 500)
+    direct_vm.mock_llm(r".*risk validator.*", '{"approved": true, "risk_score": 5}')
+    contract.assess_credit(borrower, 1000)
+    direct_vm.value = 1000
+    assert str(contract.fund_loan(loan_id, 1000)) == "FUNDED"
+    with pytest.raises(Exception) as excinfo:
+        contract.disburse_loan(loan_id, 0)
+    _assert_user_error(excinfo.value, "ZERO_DISBURSEMENT")
+
+
+def test_disburse_loan_exceeds_escrow_reverts(direct_vm, direct_deploy, direct_alice):
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+    borrower = contract._sender()
+    contract.create_borrower(borrower, 100)
+    loan_id = contract.create_loan(borrower, 1000, 500)
+    direct_vm.mock_llm(r".*risk validator.*", '{"approved": true, "risk_score": 5}')
+    contract.assess_credit(borrower, 1000)
+    direct_vm.value = 1000
+    assert str(contract.fund_loan(loan_id, 1000)) == "FUNDED"
+    with pytest.raises(Exception) as excinfo:
+        contract.disburse_loan(loan_id, 2000)
+    _assert_user_error(excinfo.value, "INSUFFICIENT_COLLATERAL")
+
+
+def test_repay_loan_unknown_loan_reverts(direct_vm, direct_deploy, direct_alice):
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception) as excinfo:
+        contract.repay_loan("loan_9999")
+    _assert_user_error(excinfo.value, "LOAN_NOT_FOUND")
+
+
+def test_repay_loan_twice_reverts(direct_vm, direct_deploy, direct_alice):
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+    borrower = contract._sender()
+    contract.create_borrower(borrower, 100)
+    loan_id = contract.create_loan(borrower, 1000, 500)
+    contract.repay_loan(loan_id)
+    with pytest.raises(Exception) as excinfo:
+        contract.repay_loan(loan_id)
+    _assert_user_error(excinfo.value, "LOAN_TERMINAL")
+
+
+def test_repay_liquidated_loan_reverts(direct_vm, direct_deploy, direct_alice):
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+    borrower = contract._sender()
+    contract.create_borrower(borrower, 100)
+    loan_id = contract.create_loan(borrower, 1000, 500)
+    contract.liquidate_loan(loan_id)
+    with pytest.raises(Exception) as excinfo:
+        contract.repay_loan(loan_id)
+    _assert_user_error(excinfo.value, "LOAN_TERMINAL")
+
+
+def test_liquidate_repaid_loan_reverts(direct_vm, direct_deploy, direct_alice):
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+    borrower = contract._sender()
+    contract.create_borrower(borrower, 100)
+    loan_id = contract.create_loan(borrower, 1000, 500)
+    contract.repay_loan(loan_id)
+    with pytest.raises(Exception) as excinfo:
+        contract.liquidate_loan(loan_id)
+    _assert_user_error(excinfo.value, "LOAN_NOT_LIQUIDATABLE")
+
+
+def test_liquidate_unknown_loan_reverts(direct_vm, direct_deploy, direct_alice):
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception) as excinfo:
+        contract.liquidate_loan("loan_9999")
+    _assert_user_error(excinfo.value, "LOAN_NOT_FOUND")
+
+
+# ------------------------------------------------------------------ #
+# Consensus decision storage & prompt integrity
+# ------------------------------------------------------------------ #
+
+
+def test_credit_assessment_getter_empty_until_consensus(direct_vm, direct_deploy, direct_alice):
+    """The app-facing getter must be empty before consensus and exact after it."""
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+    borrower = contract._sender()
+    contract.create_borrower(borrower, 750)
+    contract.create_loan(borrower, 1000, 500)
+
+    assert contract.get_credit_assessment(borrower) == ""
+    assert contract.get_credit_assessment("0x" + "ab" * 20) == ""
+
+    direct_vm.mock_llm(r".*risk validator.*", '{"approved": true, "risk_score": 42}')
+    decision = contract.assess_credit(borrower, 1000)
+
+    stored = contract.get_credit_assessment(borrower)
+    assert stored == decision
+    parsed = json.loads(stored)
+    assert parsed["approved"] is True
+    # risk_score is derived on-chain (reputation 750 -> 100 - 75), never taken from
+    # the free-form LLM answer, so validators compare only the approved verdict
+    assert parsed["risk_score"] == 25
+    assert parsed["borrower"] == borrower
+    assert parsed["amount"] == 1000
+
+
+def test_assess_prompt_uses_gen_units_and_onchain_reputation(direct_vm, direct_deploy, direct_alice):
+    """The risk prompt must show a human-scale loan size plus the on-chain history
+    instead of raw wei (previously: '10000000000000000 GEN', which made validators
+    reject every realistic request)."""
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+    borrower = contract._sender()
+    contract.create_borrower(borrower, 750)
+    contract.create_loan(borrower, 10**16, 500)  # 0.01 GEN in wei
+
+    seen_prompts = []
+    original_match = direct_vm._match_llm_mock
+
+    def _spy(prompt: str):
+        seen_prompts.append(prompt)
+        return original_match(prompt)
+
+    direct_vm._match_llm_mock = _spy
+    try:
+        direct_vm.mock_llm(r".*risk validator.*", '{"approved": true, "risk_score": 7}')
+        contract.assess_credit(borrower, 10**16)
+    finally:
+        direct_vm._match_llm_mock = original_match
+
+    assert seen_prompts, "the risk validator prompt was never captured"
+    prompt = seen_prompts[0]
+
+    # loan size in GEN units, not raw wei
+    assert f"{10**16} GEN" not in prompt, prompt
+    assert "10 milli-GEN" in prompt, prompt
+
+    # the attested on-chain history actually reaches the validator
+    assert "reputation 750" in prompt, prompt
+    assert "status active" in prompt, prompt
+    assert borrower in prompt, prompt

@@ -17,3 +17,4 @@ __pycache__/
 *.tsbuildinfo
 next-env.d.ts
 !.next/types/
+*_out.txt

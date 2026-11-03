@@ -2,12 +2,14 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import {
+  getCreditAssessmentFor,
   getLoans,
   getTransactionStatus,
   writeAssessCredit,
   writeCreateLoan,
   writeDisburseLoan,
   writeFundLoan,
+  type CreditDecision,
   type TxRecord,
 } from '@/lib/genlayer';
 import { useWallet } from '@/components/wallet/WalletProvider';
@@ -33,6 +35,24 @@ export default function LoanActions() {
   const [loanId, setLoanId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [decision, setDecision] = useState<CreditDecision | null>(null);
+
+  /* Read the verdict the quorum already committed to storage. */
+  const refreshDecision = useCallback(async () => {
+    if (!account) {
+      setDecision(null);
+      return;
+    }
+    try {
+      setDecision(await getCreditAssessmentFor(account));
+    } catch {
+      /* keep the last known verdict on transient RPC errors */
+    }
+  }, [account]);
+
+  useEffect(() => {
+    void refreshDecision();
+  }, [refreshDecision]);
 
   /* Poll the live GenLayer transaction status until it settles. */
   const waitForFinal = useCallback((hash: string, onFinalized: () => void, onError: (msg: string) => void) => {
@@ -80,6 +100,8 @@ export default function LoanActions() {
     const stop = waitForFinal(hash, () => {
       if (cancelled) return;
       setCredit((prev) => (prev.phase === 'submitted' ? { phase: 'finalized', hash: prev.hash } : prev));
+      // the verdict is committed with the transaction — read it back
+      void refreshDecision();
     }, (msg) => {
       if (cancelled) return;
       setCredit({ phase: 'error', error: msg });
@@ -88,7 +110,7 @@ export default function LoanActions() {
       cancelled = true;
       stop();
     };
-  }, [credit.phase, credit.hash, waitForFinal]);
+  }, [credit.phase, credit.hash, waitForFinal, refreshDecision]);
 
   const runCreateLoan = useCallback(async () => {
     if (!account || !provider) return;
@@ -257,6 +279,33 @@ export default function LoanActions() {
               tx {shortHash(credit.hash)}
             </p>
           )}
+
+          {/* Verdict the quorum committed to contract storage */}
+          <div className="mt-4 border-t border-line/60 pt-4 font-mono text-[12px] space-y-2.5">
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-sage">On-record verdict</span>
+              {decision ? (
+                <span className={decision.approved ? 'text-verdigris' : 'text-stamp'}>
+                  {decision.approved ? 'Approved' : 'Rejected'}
+                </span>
+              ) : (
+                <span className="text-sage/60">none stored</span>
+              )}
+            </div>
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-sage">Risk score</span>
+              <span className="text-bone">
+                {decision?.risk_score !== undefined ? `${decision.risk_score}/100` : '—'}
+              </span>
+            </div>
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-sage">Assessed amount</span>
+              <span className="text-bone">
+                {decision?.amount !== undefined ? `${Number(decision.amount).toLocaleString()} GEN` : '—'}
+              </span>
+            </div>
+          </div>
+
           {actionError && <p className="mt-3 font-mono text-[11px] text-stamp">{actionError}</p>}
         </div>
 
@@ -320,7 +369,19 @@ export default function LoanActions() {
             </div>
             <div className="flex items-center justify-between gap-4 pt-3">
               <dt className="text-sage">Consensus gate</dt>
-              <dd className="text-bone text-right">{assessmentFinal ? 'Assessment final' : 'Awaiting assessment'}</dd>
+              <dd
+                className={`text-right ${
+                  decision ? (decision.approved ? 'text-verdigris' : 'text-stamp') : 'text-bone'
+                }`}
+              >
+                {decision
+                  ? decision.approved
+                    ? 'Approved — funding unlocked'
+                    : 'Rejected — funding blocked'
+                  : assessmentFinal
+                    ? 'Assessment final'
+                    : 'Awaiting assessment'}
+              </dd>
             </div>
           </div>
         </div>

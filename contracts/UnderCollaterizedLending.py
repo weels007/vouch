@@ -8,6 +8,12 @@ from genlayer.gl import *
 import json
 import typing
 
+# `from genlayer.gl import *` re-exports the abstract `Contract` base class into
+# this module's namespace. Drop that binding so automated contract discovery
+# resolves to the concrete `UnderCollaterizedLending` subclass declared below
+# instead of the abstract base (which is not storage-annotated).
+globals().pop("Contract", None)
+
 
 @gl.evm.contract_interface
 class _Escrow:
@@ -179,36 +185,102 @@ class UnderCollaterizedLending(gl.Contract):
         return decision
 
     def _run_credit_consensus(self, borrower: str, amount: u256) -> str:
-        """Run the validator-consensus NLP assessment via the comparative principle."""
+        """Run the validator-consensus NLP assessment via the comparative principle.
+
+        Only the LLM verdict travels through consensus: validators must agree on the
+        single ``approved`` boolean. Free-form fields (scores, wording) would make the
+        NLP equivalence judge reject identical decisions and stall the transaction in
+        UNDETERMINED, so every other field is derived deterministically on-chain.
+        """
+        profile = self.borrowers.get(borrower)
+        if profile is None:
+            status = "unknown"
+            reputation = 0
+            total_borrowed = 0
+            total_repaid = 0
+        else:
+            status = profile.status
+            reputation = int(profile.reputation)
+            total_borrowed = int(profile.total_borrowed)
+            total_repaid = int(profile.total_repaid)
+
+        # express the request in GEN (not wei) so validators judge a real loan size
+        gen_whole = int(amount) // 10**18
+        gen_milli = (int(amount) % 10**18) // 10**15
+
         prompt = (
             "You are the risk validator for an under-collateralized lending protocol. "
-            f"Evaluate whether borrower {borrower} may receive a loan of {int(amount)} GEN "
-            "based on the attested reputation history and market conditions. "
-            "Reply only in JSON format with keys: approved (bool), risk_score (int), reasoning (str)."
+            f"Borrower {borrower} requests {gen_whole} GEN and {gen_milli} milli-GEN "
+            f"secured only by reputation. On-chain attested history for this borrower: "
+            f"profile status {status}, reputation {reputation} (scale 0-1000), "
+            f"total borrowed {total_borrowed}, total repaid {total_repaid}. "
+            "Apply exactly this rule: reply approved=true ONLY IF status is 'active' "
+            "AND reputation is at least 600 AND the request is at most 100 GEN; "
+            "in every other case reply approved=false. "
+            "Reply only in JSON format with keys: approved (bool), reasoning (str)."
         )
 
         def call_llm() -> str:
             response = gl.nondet.exec_prompt(prompt, response_format="json")
-            parsed = json.loads(response)
-            return json.dumps(
-                {
-                    "borrower": borrower,
-                    "amount": int(amount),
-                    "approved": bool(parsed.get("approved", False)),
-                    "risk_score": int(parsed.get("risk_score") or 0),
-                }
-            )
+            parsed = json.loads(response) if isinstance(response, str) else (response or {})
+            # consensus payload: only the verdict, identical across honest validators
+            return json.dumps({"approved": bool(parsed.get("approved", False))})
 
         decision = gl.eq_principle.prompt_comparative(
             call_llm,
-            principle="The approved flag and risk_score must be consistent between validators.",
+            principle=(
+                "Both answers are the approval verdict for the same borrower and the "
+                "identical loan request. They are equivalent if and only if the "
+                "approved boolean matches exactly; ignore reasoning, wording and formatting."
+            ),
         )
-        resolved = decision.get()
-        return resolved if isinstance(resolved, str) else json.dumps(resolved)
+        resolved = decision.get() if hasattr(decision, "get") else decision
+        if isinstance(resolved, str):
+            verdict = json.loads(resolved)
+        elif isinstance(resolved, dict):
+            verdict = resolved
+        else:
+            verdict = {}
+
+        return json.dumps(
+            {
+                "borrower": borrower,
+                "amount": int(amount),
+                "approved": bool(verdict.get("approved", False)),
+                "risk_score": self._risk_score(status, reputation, total_borrowed, total_repaid),
+            }
+        )
+
+    def _risk_score(self, status: str, reputation: int, total_borrowed: int, total_repaid: int) -> int:
+        """Deterministic 0-100 risk score (100 = riskiest) from on-chain history only."""
+        if status != "active":
+            return 100
+        score = 100 - min(100, reputation // 10)
+        if total_borrowed > 0 and total_repaid < total_borrowed:
+            score = min(100, score + 20)
+        return score
 
     def _store_credit_decision(self, borrower: str, decision: str) -> None:
         """Persist the consensus decision."""
         self.credit_assessments[borrower] = decision
+
+    @gl.public.view
+    def get_credit_assessment(self, borrower: str) -> str:
+        """Latest consensus credit decision for a borrower (empty string if never assessed)."""
+        return self.credit_assessments.get(borrower, "")
+
+    @gl.public.view
+    def get_credit_assessments(self) -> typing.Any:
+        """Every stored consensus credit decision, keyed by borrower address."""
+        result = {}
+        for i in range(int(self.next_loan_id)):
+            loan = self.loans.get(f"loan_{i}")
+            if loan is None:
+                continue
+            decision = self.credit_assessments.get(loan.borrower)
+            if decision:
+                result[loan.borrower] = decision
+        return result
 
     @gl.public.view
     def get_loan_count(self) -> typing.Any:

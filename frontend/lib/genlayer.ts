@@ -9,7 +9,7 @@
 import { createWalletClient, custom, encodeFunctionData, defineChain } from 'viem';
 import type { Abi, Hash, WalletClient } from 'viem';
 
-export const CONTRACT_ADDRESS = '0x1912fcB4C281c28FE8376C8563075F309AAe834e';
+export const CONTRACT_ADDRESS = '0x1cEF4eaC8afABBc389f538765dA3da5eab885dA4';
 export const CHAIN_ID = '0xf22f';
 
 /** GenLayer Studionet — EIP-1193 chain the wallets are pointed at. */
@@ -276,6 +276,50 @@ export async function getBorrowerBySender(address: string): Promise<Record<strin
   return {};
 }
 
+/** Shape of a stored validator-consensus credit decision. */
+export interface CreditDecision {
+  borrower?: string;
+  amount?: number;
+  approved?: boolean;
+  risk_score?: number;
+}
+
+/** Parse a stored consensus decision JSON blob (null when absent or malformed). */
+export function parseCreditDecision(raw: unknown): CreditDecision | null {
+  if (typeof raw !== 'string' || raw.trim() === '') return null;
+  try {
+    const parsed = JSON.parse(raw) as CreditDecision;
+    return typeof parsed === 'object' && parsed !== null ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Every stored consensus credit decision, keyed by borrower address.
+ * Only borrowers that went through `assess_credit` appear — an empty map means
+ * the validator quorum has never settled a decision for anyone yet.
+ */
+export async function getCreditAssessments(): Promise<Record<string, string>> {
+  const result = await callRead(
+    'get_credit_assessments',
+    '0xe2a00e066d6574686f64b4016765745f6372656469745f6173736573736d656e747300',
+    '0x0000000000000000000000000000000000000000',
+  );
+  const decoded = decodeGenCallResult(String(result ?? ''));
+  if (decoded && typeof decoded === 'object' && !Array.isArray(decoded)) {
+    return decoded as Record<string, string>;
+  }
+  return {};
+}
+
+/** Consensus decision recorded for one borrower. */
+export async function getCreditAssessmentFor(address: string): Promise<CreditDecision | null> {
+  const all = await getCreditAssessments();
+  const key = Object.keys(all).find((k) => k.toLowerCase() === address.toLowerCase());
+  return key ? parseCreditDecision(all[key]) : null;
+}
+
 /**
  * Resolve the lifecycle status of a GenLayer transaction:
  * pending -> accepted -> finalized | error
@@ -302,6 +346,18 @@ export async function getTransactionStatus(txHash: string): Promise<TxRecord> {
   }
 
   const tx = await rpc<{ status?: string; from?: string } | null>('eth_getTransactionByHash', [txHash]);
+
+  // UNDETERMINED means the validator quorum never agreed — nothing was committed.
+  if (tx?.status === 'UNDETERMINED') {
+    return {
+      hash: txHash,
+      status: 'error',
+      sender: tx?.from ?? receipt.from,
+      blockNumber: receipt.blockNumber,
+      gasUsed: receipt.gasUsed,
+      error: 'Consensus did not settle (validators disagreed) — no state change was committed.',
+    };
+  }
 
   const status: TxStatus = tx?.status === 'FINALIZED' ? 'finalized' : 'accepted';
   return {
