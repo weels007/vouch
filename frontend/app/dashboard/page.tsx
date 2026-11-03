@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { getBorrowerBySender, getLoans, getLoanCount } from '@/lib/genlayer';
 import { useWallet } from '@/components/wallet/WalletProvider';
 import WalletGate from '@/components/wallet/WalletGate';
+import LoanActions from '@/components/LoanActions';
 
 interface Profile {
   id?: string;
@@ -148,6 +149,9 @@ export default function Dashboard() {
             <div className="font-display text-[34px] leading-none mt-3 text-bone">{loanCount}</div>
           </div>
         </div>
+
+        {/* Live, consensus-settled protocol actions */}
+        <LoanActions />
 
         {/* Loans — live from the contract */}
         <div className="border border-line rounded-lg overflow-hidden">

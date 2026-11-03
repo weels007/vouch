@@ -71,11 +71,15 @@ Verify identity → Score on-chain → Apply → Receive funds → Repay → Rep
 - **Contract class:** `UnderCollaterizedLending`
 - **Pinned runner:** `py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6`
 - **Deployed (testnet):** `0x4F0367C3c238A70dFc79D9a1f35Acaa037F7388C`
-- **Methods:** 11 (6 write · 5 view) — lint-validated with `genvm-lint check`
+- **Methods:** 12 (7 write · 5 view) — lint-validated with `genvm-lint check`
 
-Key write methods: `fund_loan`, `disburse_loan`, `repay_loan`, `liquidate_loan`, plus
-profile management entry points. Read methods cover loan counts, loan lists, borrower
-profiles, and per-loan lookups.
+Key write methods: `assess_credit` (validator-consensus credit verdict), `fund_loan`,
+`disburse_loan`, `repay_loan`, `liquidate_loan`, plus `create_borrower` / `create_loan` for the
+proposal lifecycle. Funding is gated by the consensus-backed credit decision.
+
+The credit path is non-deterministic on purpose: `assess_credit` runs an LLM comparative
+consensus (`gl.eq_principle.prompt_comparative`) over the borrower risk profile, stores the
+agreed verdict, and only then may a loan be funded — rejected credit cannot be funded.
 
 ## 🏗 Architecture
 

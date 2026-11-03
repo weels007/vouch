@@ -6,8 +6,95 @@
  * wallet via EIP-1193 and are submitted through the GenLayer consensus layer.
  */
 
-export const CONTRACT_ADDRESS = '0x4F0367C3c238A70dFc79D9a1f35Acaa037F7388C';
+import { createWalletClient, custom, encodeFunctionData, defineChain } from 'viem';
+import type { Abi, Hash, WalletClient } from 'viem';
+
+export const CONTRACT_ADDRESS = '0x1912fcB4C281c28FE8376C8563075F309AAe834e';
 export const CHAIN_ID = '0xf22f';
+
+/** GenLayer Studionet — EIP-1193 chain the wallets are pointed at. */
+export const GENLAYER_CHAIN = defineChain({
+  id: 61999,
+  name: 'Genlayer Studio Network',
+  nativeCurrency: { name: 'GEN', symbol: 'GEN', decimals: 18 },
+  rpcUrls: { default: { http: ['https://studio.genlayer.com/api'] } },
+});
+
+/** Minimal EIP-1193 surface the write layer needs. */
+export interface EIP1193Provider {
+  request(args: { method: string; params?: unknown[] | object }): Promise<unknown>;
+  on?(event: string, listener: (...args: unknown[]) => void): void;
+  removeListener?(event: string, listener: (...args: unknown[]) => void): void;
+}
+
+/** Minimal human-readable ABI of UnderCollaterizedLending (GenLayer VM contract). */
+export const UnderCollateralizedLendingABI: Abi = [
+  {
+    type: 'function',
+    name: 'assess_credit',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'borrower', type: 'string' },
+      { name: 'amount', type: 'uint256' },
+    ],
+    outputs: [{ type: 'string' }],
+  },
+  {
+    type: 'function',
+    name: 'create_borrower',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'borrower', type: 'string' },
+      { name: 'reputation', type: 'uint256' },
+    ],
+    outputs: [],
+  },
+  {
+    type: 'function',
+    name: 'create_loan',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'borrower', type: 'string' },
+      { name: 'amount', type: 'uint256' },
+      { name: 'interest_rate', type: 'uint256' },
+    ],
+    outputs: [{ type: 'string' }],
+  },
+  {
+    type: 'function',
+    name: 'fund_loan',
+    stateMutability: 'payable',
+    inputs: [
+      { name: 'loan_id', type: 'string' },
+      { name: 'amount', type: 'uint256' },
+    ],
+    outputs: [{ type: 'string' }],
+  },
+  {
+    type: 'function',
+    name: 'disburse_loan',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'loan_id', type: 'string' },
+      { name: 'amount', type: 'uint256' },
+    ],
+    outputs: [{ type: 'string' }],
+  },
+  {
+    type: 'function',
+    name: 'repay_loan',
+    stateMutability: 'nonpayable',
+    inputs: [{ name: 'loan_id', type: 'string' }],
+    outputs: [],
+  },
+  {
+    type: 'function',
+    name: 'liquidate_loan',
+    stateMutability: 'nonpayable',
+    inputs: [{ name: 'loan_id', type: 'string' }],
+    outputs: [],
+  },
+];
 
 export type TxStatus = 'pending' | 'accepted' | 'finalized' | 'error';
 
@@ -224,4 +311,131 @@ export async function getTransactionStatus(txHash: string): Promise<TxRecord> {
     blockNumber: receipt.blockNumber,
     gasUsed: receipt.gasUsed,
   };
+}
+
+/* ------------------------------------------------------------------ *
+ * Writes — wallet-signed transactions submitted through the GenLayer
+ * consensus layer. The connected EIP-1193 wallet signs the transaction
+ * (eth_sendTransaction) and the resulting call is settled by the GenLayer
+ * leader + validator consensus before it is final.
+ * ------------------------------------------------------------------ */
+
+/** GEN has 18 decimals, so amounts are handled as base-unit integers. */
+const GEN_UNIT = BigInt(10) ** BigInt(18);
+
+export interface WriteOutcome {
+  hash: string;
+  ok: boolean;
+  error?: string;
+}
+
+function walletClientFor(provider: EIP1193Provider, account: string): WalletClient {
+  const transport = custom(provider as never);
+  return createWalletClient({
+    account: account as `0x${string}`,
+    chain: GENLAYER_CHAIN,
+    transport,
+  });
+}
+
+async function sendContractCall(
+  provider: EIP1193Provider,
+  account: string,
+  call: { functionName: string; args?: unknown[]; value?: bigint },
+): Promise<{ hash: string; ok: boolean; error?: string }> {
+  try {
+    const walletClient = walletClientFor(provider, account);
+    const data = await encodeFunctionData({
+      abi: UnderCollateralizedLendingABI,
+      functionName: call.functionName,
+      args: call.args ?? [],
+    });
+    const hash = await walletClient.sendTransaction({
+      to: CONTRACT_ADDRESS as `0x${string}`,
+      data,
+      account: account as `0x${string}`,
+      chain: GENLAYER_CHAIN,
+      ...(call.value !== undefined ? { value: call.value } : {}),
+    });
+    return { hash, ok: true };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Transaction submission failed.';
+    return { hash: '', ok: false, error: message };
+  }
+}
+
+/** Consensus-driven credit assessment: runs the LLM comparative judgement. */
+export async function writeAssessCredit(
+  provider: EIP1193Provider,
+  account: string,
+  borrower: string,
+  amount: bigint,
+): Promise<{ hash: string; ok: boolean; error?: string }> {
+  return sendContractCall(provider, account, { functionName: 'assess_credit', args: [borrower, amount] });
+}
+
+/** Register (or refresh) a borrower profile on-chain. */
+export async function writeCreateBorrower(
+  provider: EIP1193Provider,
+  account: string,
+  borrower: string,
+  reputation: bigint,
+): Promise<{ hash: string; ok: boolean; error?: string }> {
+  return sendContractCall(provider, account, { functionName: 'create_borrower', args: [borrower, reputation] });
+}
+
+/** Open a new loan proposal for a borrower. */
+export async function writeCreateLoan(
+  provider: EIP1193Provider,
+  account: string,
+  borrower: string,
+  amount: bigint,
+  interestRate: bigint,
+): Promise<{ hash: string; ok: boolean; error?: string }> {
+  return sendContractCall(provider, account, {
+    functionName: 'create_loan',
+    args: [borrower, amount, interestRate],
+  });
+}
+
+/** Lock GEN into escrow against a loan request (under-collateralized funding). */
+export async function writeFundLoan(
+  provider: EIP1193Provider,
+  account: string,
+  loanId: string,
+  amount: bigint,
+): Promise<{ hash: string; ok: boolean; error?: string }> {
+  return sendContractCall(provider, account, {
+    functionName: 'fund_loan',
+    args: [loanId, amount],
+    value: amount * GEN_UNIT,
+  });
+}
+
+/** Release escrowed GEN to the borrower after funding. */
+export async function writeDisburseLoan(
+  provider: EIP1193Provider,
+  account: string,
+  loanId: string,
+  amount: bigint,
+): Promise<{ hash: string; ok: boolean; error?: string }> {
+  return sendContractCall(provider, account, { functionName: 'disburse_loan', args: [loanId, amount] });
+}
+
+/** Mark a loan as repaid; repaid principal returns to escrow. */
+export async function writeRepayLoan(
+  provider: EIP1193Provider,
+  account: string,
+  loanId: string,
+): Promise<{ hash: string; ok: boolean; error?: string }> {
+  return sendContractCall(provider, account, { functionName: 'repay_loan', args: [loanId] });
+}
+
+/** Liquidate a loan (mark as defaulted). */
+export async function writeLiquidateLoan(
+  provider: EIP1193Provider,
+  account: string,
+  loanId: string,
+): Promise<{ hash: string; ok: boolean; error?: string }> {
+  return sendContractCall(provider, account, { functionName: 'liquidate_loan', args: [loanId] });
 }

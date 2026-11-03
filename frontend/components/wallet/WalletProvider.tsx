@@ -31,6 +31,7 @@ interface WalletContextValue {
   connecting: string | null; // rdns of the provider being connected
   error: string | null;
   modalOpen: boolean;
+  provider: EIP1193Provider | null;
   connect: (rdns: string) => Promise<void>;
   disconnect: () => void;
   openModal: () => void;
@@ -51,7 +52,6 @@ export function useWallet(): WalletContextValue {
   if (!ctx) throw new Error('useWallet must be used inside <WalletProvider>');
   return ctx;
 }
-
 /* ---------- Helpers ---------- */
 
 function shortAddress(addr: string): string {
@@ -119,6 +119,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
   const [connecting, setConnecting] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
+  const [provider, setProvider] = useState<EIP1193Provider | null>(null);
 
   const providersRef = useRef<AnnouncedProvider[]>([]);
   const listenersRef = useRef<Array<{ provider: EIP1193Provider; event: string; fn: (...a: unknown[]) => void }>>([]);
@@ -190,6 +191,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
         const list = accounts as string[];
         if (list && list.length > 0) {
           setAccount(list[0]);
+          setProvider(entry.provider);
           attachListeners(entry.provider);
           const cid = await entry.provider.request({ method: 'eth_chainId' });
           if (!cancelled) setChainId(String(cid));
@@ -230,6 +232,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
           setChainId(String(cidAfter));
         }
         attachListeners(entry.provider);
+        setProvider(entry.provider);
         localStorage.setItem(STORAGE_KEY, rdns);
         setModalOpen(false);
       } catch (err) {
@@ -253,6 +256,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     listenersRef.current = [];
     setAccount(null);
     setChainId(null);
+    setProvider(null);
     setError(null);
     localStorage.removeItem(STORAGE_KEY);
   }, []);
@@ -274,6 +278,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     connecting,
     error,
     modalOpen,
+    provider,
     connect,
     disconnect,
     openModal,

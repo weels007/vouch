@@ -55,6 +55,7 @@ class UnderCollaterizedLending(gl.Contract):
     total_lent: u256
     total_repaid: u256
     total_refunded: u256
+    credit_assessments: TreeMap[str, str]
 
     def __init__(self):
         # Storage fields are class-level annotations — no manual initialization needed
@@ -138,6 +139,11 @@ class UnderCollaterizedLending(gl.Contract):
             raise gl.vm.UserError("ZERO_FUNDING")
         if self._sender() != loan.borrower:
             raise gl.vm.UserError("NOT_BORROWER")
+        assessment = self.credit_assessments.get(loan.borrower)
+        if not assessment:
+            raise gl.vm.UserError("CREDIT_NOT_ASSESSED")
+        if not json.loads(assessment).get("approved", False):
+            raise gl.vm.UserError("CREDIT_REJECTED")
         if gl.message.value != amount:
             raise gl.vm.UserError("WRONG_VALUE")
         self.loan_escrow[loan_id] = self.loan_escrow.get(loan_id, u256(0)) + amount
@@ -164,6 +170,45 @@ class UnderCollaterizedLending(gl.Contract):
         _Escrow(Address(loan.borrower)).emit_transfer(value=amount)
         loan.status = "active"
         return "DISBURSED"
+
+    @gl.public.write
+    def assess_credit(self, borrower: str, amount: u256) -> str:
+        """Run a validator-consensus (LLM) risk assessment that can gate lending."""
+        decision = self._run_credit_consensus(borrower, amount)
+        self._store_credit_decision(borrower, decision)
+        return decision
+
+    def _run_credit_consensus(self, borrower: str, amount: u256) -> str:
+        """Run the validator-consensus NLP assessment via the comparative principle."""
+        prompt = (
+            "You are the risk validator for an under-collateralized lending protocol. "
+            f"Evaluate whether borrower {borrower} may receive a loan of {int(amount)} GEN "
+            "based on the attested reputation history and market conditions. "
+            "Reply only in JSON format with keys: approved (bool), risk_score (int), reasoning (str)."
+        )
+
+        def call_llm() -> str:
+            response = gl.nondet.exec_prompt(prompt, response_format="json")
+            parsed = json.loads(response)
+            return json.dumps(
+                {
+                    "borrower": borrower,
+                    "amount": int(amount),
+                    "approved": bool(parsed.get("approved", False)),
+                    "risk_score": int(parsed.get("risk_score") or 0),
+                }
+            )
+
+        decision = gl.eq_principle.prompt_comparative(
+            call_llm,
+            principle="The approved flag and risk_score must be consistent between validators.",
+        )
+        resolved = decision.get()
+        return resolved if isinstance(resolved, str) else json.dumps(resolved)
+
+    def _store_credit_decision(self, borrower: str, decision: str) -> None:
+        """Persist the consensus decision."""
+        self.credit_assessments[borrower] = decision
 
     @gl.public.view
     def get_loan_count(self) -> typing.Any:
