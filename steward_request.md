@@ -75,7 +75,8 @@ Contract side needed no change — it already takes base units and enforces
 - [x] Four new tests (conversion, e2e flow, regression, source guard)
 - [x] `pytest tests/direct/ -q` green — **37 passed** (33 existing + 4 new)
 - [x] `npx tsc --noEmit` + `npm run build` green
-- [ ] Commit + push to `github.com/weels007/vouch`
+- [x] `genvm-lint check` green — 14 methods (7 view, 7 write)
+- [x] Commit + push to `github.com/weels007/vouch` — `ba8a948`
 - [ ] Reply to steward with the fix summary
 
 ---
