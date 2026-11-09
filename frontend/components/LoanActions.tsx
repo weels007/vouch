@@ -2,10 +2,14 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import {
+  formatBaseUnits,
+  getBorrowerBySender,
   getCreditAssessmentFor,
   getLoans,
   getTransactionStatus,
+  toBaseUnits,
   writeAssessCredit,
+  writeCreateBorrower,
   writeCreateLoan,
   writeDisburseLoan,
   writeFundLoan,
@@ -29,13 +33,32 @@ function shortHash(hash: string): string {
 
 export default function LoanActions() {
   const { account, provider, openModal } = useWallet();
-  const [amount, setAmount] = useState('100');
+  const [amount, setAmount] = useState('1');
   const [interestRate, setInterestRate] = useState('500');
   const [credit, setCredit] = useState<CreditState>(IDLE_CREDIT);
   const [loanId, setLoanId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [decision, setDecision] = useState<CreditDecision | null>(null);
+  const [profileStatus, setProfileStatus] = useState<string | null>(null);
+
+  /* Is the connected wallet registered as an active borrower on-chain? */
+  const refreshProfile = useCallback(async () => {
+    if (!account) {
+      setProfileStatus(null);
+      return;
+    }
+    try {
+      const profile = await getBorrowerBySender(account);
+      setProfileStatus(String(profile.status ?? 'unknown'));
+    } catch {
+      /* keep the last known status on transient RPC errors */
+    }
+  }, [account]);
+
+  useEffect(() => {
+    void refreshProfile();
+  }, [refreshProfile]);
 
   /* Read the verdict the quorum already committed to storage. */
   const refreshDecision = useCallback(async () => {
@@ -69,17 +92,40 @@ export default function LoanActions() {
     return () => clearInterval(timer);
   }, []);
 
+  /* Register the wallet so the quorum has an on-chain profile to judge
+     (create_borrower is part of the contract lifecycle). */
+  const runRegister = useCallback(async () => {
+    if (!account || !provider) return;
+    setBusy(true);
+    setActionError(null);
+    const outcome = await writeCreateBorrower(provider, account, account, BigInt(800));
+    setBusy(false);
+    if (!outcome.ok) {
+      setActionError(outcome.error ?? 'Registration failed.');
+      return;
+    }
+    const stop = waitForFinal(
+      outcome.hash,
+      () => {
+        setProfileStatus('active');
+        window.dispatchEvent(new CustomEvent('vouch:profile-changed'));
+      },
+      () => setActionError('Registration failed on-chain.'),
+    );
+    void stop;
+  }, [account, provider, waitForFinal]);
+
   const runCredit = useCallback(async () => {
     if (!account || !provider) return;
     let value: bigint;
     try {
-      value = BigInt(amount);
+      value = toBaseUnits(amount);
     } catch {
-      setCredit({ phase: 'error', error: 'Enter a valid assessment amount greater than zero.' });
+      setCredit({ phase: 'error', error: 'Enter a valid GEN amount greater than zero (decimals allowed).' });
       return;
     }
     if (value <= BigInt(0)) {
-      setCredit({ phase: 'error', error: 'Enter a valid assessment amount greater than zero.' });
+      setCredit({ phase: 'error', error: 'Enter a valid GEN amount greater than zero (decimals allowed).' });
       return;
     }
     setBusy(true);
@@ -117,10 +163,10 @@ export default function LoanActions() {
     let loanAmount: bigint;
     let rate: bigint;
     try {
-      loanAmount = BigInt(amount);
+      loanAmount = toBaseUnits(amount);
       rate = BigInt(interestRate);
     } catch {
-      setActionError('Enter a valid loan amount and interest rate.');
+      setActionError('Enter a valid loan amount (GEN) and interest rate.');
       return;
     }
     setBusy(true);
@@ -152,13 +198,13 @@ export default function LoanActions() {
     if (!account || !provider || !loanId) return;
     let value: bigint;
     try {
-      value = BigInt(amount);
+      value = toBaseUnits(amount);
     } catch {
-      setActionError('Enter a valid funding amount greater than zero.');
+      setActionError('Enter a valid funding amount in GEN greater than zero.');
       return;
     }
     if (value <= BigInt(0)) {
-      setActionError('Enter a valid funding amount greater than zero.');
+      setActionError('Enter a valid funding amount in GEN greater than zero.');
       return;
     }
     setBusy(true);
@@ -181,13 +227,13 @@ export default function LoanActions() {
     if (!account || !provider || !loanId) return;
     let value: bigint;
     try {
-      value = BigInt(amount);
+      value = toBaseUnits(amount);
     } catch {
-      setActionError('Enter a valid disbursement amount greater than zero.');
+      setActionError('Enter a valid disbursement amount in GEN greater than zero.');
       return;
     }
     if (value <= BigInt(0)) {
-      setActionError('Enter a valid disbursement amount greater than zero.');
+      setActionError('Enter a valid disbursement amount in GEN greater than zero.');
       return;
     }
     setBusy(true);
@@ -247,13 +293,35 @@ export default function LoanActions() {
             history. The agreed verdict can gate funding.
           </p>
 
+          {/* Onboarding: the quorum can only judge an on-chain borrower profile */}
+          {profileStatus !== 'active' && (
+            <div className="mb-5 border border-line/60 rounded-md bg-ink-2 p-4 flex flex-wrap items-center justify-between gap-3">
+              <p className="text-[13px] text-sage leading-snug max-w-sm">
+                No borrower profile on record. The quorum reads your on-chain history
+                (status + reputation), so register first — reputation 800.
+              </p>
+              <button
+                onClick={() => void runRegister()}
+                disabled={busy}
+                className="shrink-0 px-5 h-10 text-[13px] font-semibold border border-verdigris/60 text-verdigris-2 rounded-md hover:bg-verdigris/10 transition-colors disabled:opacity-50"
+              >
+                {busy ? 'Registering…' : 'Register borrower'}
+              </button>
+            </div>
+          )}
+          {profileStatus === 'active' && (
+            <div className="mb-5 font-mono text-[11px] tracking-widest uppercase text-verdigris">
+              Borrower profile active on-chain
+            </div>
+          )}
+
           <div className="flex flex-col sm:flex-row gap-3">
             <div className="flex-1 h-11 border border-line rounded-md bg-ink-2 px-4 flex items-center">
               <input
                 value={amount}
-                onChange={(e) => setAmount(e.target.value.replace(/[^0-9]/g, ''))}
+                onChange={(e) => setAmount(e.target.value.replace(/[^0-9.]/g, '').replace(/(\.[0-9]*)\./g, '$1'))}
                 placeholder="Amount (GEN)"
-                inputMode="numeric"
+                inputMode="decimal"
                 className="w-full bg-transparent outline-none text-inherit font-inherit"
               />
             </div>
@@ -301,7 +369,7 @@ export default function LoanActions() {
             <div className="flex items-center justify-between gap-4">
               <span className="text-sage">Assessed amount</span>
               <span className="text-bone">
-                {decision?.amount !== undefined ? `${Number(decision.amount).toLocaleString()} GEN` : '—'}
+                {decision?.amount !== undefined ? `${formatBaseUnits(decision.amount)} GEN` : '—'}
               </span>
             </div>
           </div>
@@ -321,9 +389,9 @@ export default function LoanActions() {
             <div className="h-11 border border-line rounded-md bg-ink-2 px-4 flex items-center">
               <input
                 value={amount}
-                onChange={(e) => setAmount(e.target.value.replace(/[^0-9]/g, ''))}
+                onChange={(e) => setAmount(e.target.value.replace(/[^0-9.]/g, '').replace(/(\.[0-9]*)\./g, '$1'))}
                 placeholder="Amount (GEN)"
-                inputMode="numeric"
+                inputMode="decimal"
                 className="w-full bg-transparent outline-none text-inherit font-inherit"
               />
             </div>

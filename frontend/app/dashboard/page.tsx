@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import {
+  formatBaseUnits,
   getBorrowerBySender,
   getCreditAssessmentFor,
   getLoanCount,
@@ -16,19 +17,19 @@ interface Profile {
   id?: string;
   status?: string;
   reputation?: number;
-  total_borrowed?: number;
-  total_repaid?: number;
+  total_borrowed?: string | number;
+  total_repaid?: string | number;
 }
 
 interface LoanRecord {
   id?: string;
   borrower?: string;
-  amount?: number;
+  amount?: number | string;
   interest_rate?: number;
   status?: string;
   created_at?: string;
   due_date?: string;
-  deposited?: number;
+  deposited?: number | string;
 }
 
 export default function Dashboard() {
@@ -39,6 +40,15 @@ export default function Dashboard() {
   const [decision, setDecision] = useState<CreditDecision | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [refreshKey, setRefreshKey] = useState(0);
+
+  /* LoanActions dispatches this after a settled write (e.g. registration),
+     so the profile/ledger above re-reads without a manual reload. */
+  useEffect(() => {
+    const onProfileChanged = () => setRefreshKey((k) => k + 1);
+    window.addEventListener('vouch:profile-changed', onProfileChanged);
+    return () => window.removeEventListener('vouch:profile-changed', onProfileChanged);
+  }, []);
 
   useEffect(() => {
     if (!account) {
@@ -90,7 +100,7 @@ export default function Dashboard() {
     return () => {
       cancelled = true;
     };
-  }, [account]);
+  }, [account, refreshKey]);
 
   const statusChip: Record<string, string> = {
     active: 'bg-seal/10 text-seal border border-seal/30',
@@ -111,8 +121,8 @@ export default function Dashboard() {
   };
 
   const reputation = Number(profile?.reputation ?? 0);
-  const totalBorrowed = Number(profile?.total_borrowed ?? 0);
-  const totalRepaid = Number(profile?.total_repaid ?? 0);
+  const totalBorrowed = profile?.total_borrowed ?? 0;
+  const totalRepaid = profile?.total_repaid ?? 0;
 
   return (
     <section className="pt-32 md:pt-40 pb-20">
@@ -143,14 +153,14 @@ export default function Dashboard() {
           <div className="bg-ink p-6">
             <div className="font-mono text-[10px] tracking-[0.2em] uppercase text-sage">Total borrowed</div>
             <div className="font-display text-[34px] leading-none mt-3 text-bone">
-              {totalBorrowed.toLocaleString()}
+              {formatBaseUnits(totalBorrowed)}
               <span className="text-lg text-sage"> GEN</span>
             </div>
           </div>
           <div className="bg-ink p-6">
             <div className="font-mono text-[10px] tracking-[0.2em] uppercase text-sage">Total repaid</div>
             <div className="font-display text-[34px] leading-none mt-3 text-bone">
-              {totalRepaid.toLocaleString()}
+              {formatBaseUnits(totalRepaid)}
               <span className="text-lg text-sage"> GEN</span>
             </div>
           </div>
@@ -196,7 +206,7 @@ export default function Dashboard() {
                   </div>
                   <div className="font-mono text-[11px] text-sage mt-1">
                     risk score {decision.risk_score ?? '—'}/100 ·{' '}
-                    {Number(decision.amount ?? 0).toLocaleString()} GEN
+                    {formatBaseUnits(decision.amount ?? 0)} GEN
                   </div>
                 </>
               )}
@@ -239,7 +249,7 @@ export default function Dashboard() {
                       className="border-b border-line/60 last:border-b-0 hover:bg-ink-2 transition-colors"
                     >
                       <td className="px-7 py-4 font-mono text-[13px] text-bone">{loanId}</td>
-                      <td className="px-7 py-4 text-bone font-medium">{Number(loan.amount ?? 0).toLocaleString()} GEN</td>
+                      <td className="px-7 py-4 text-bone font-medium">{formatBaseUnits(loan.amount ?? 0)} GEN</td>
                       <td className="px-7 py-4 font-mono text-sage">{loan.interest_rate !== undefined ? `${Number(loan.interest_rate) / 100}%` : '—'}</td>
                       <td className="px-7 py-4">
                         <span className={`inline-block px-3 py-1 rounded-full text-[11px] font-semibold ${statusChip[loan.status ?? ''] ?? 'bg-ink-3 text-sage border border-line'}`}>

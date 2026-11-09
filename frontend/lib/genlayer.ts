@@ -276,10 +276,10 @@ export async function getBorrowerBySender(address: string): Promise<Record<strin
   return {};
 }
 
-/** Shape of a stored validator-consensus credit decision. */
+/** Shape of a stored validator-consensus credit decision (amount in wei). */
 export interface CreditDecision {
   borrower?: string;
-  amount?: number;
+  amount?: number | string;
   approved?: boolean;
   risk_score?: number;
 }
@@ -379,6 +379,31 @@ export async function getTransactionStatus(txHash: string): Promise<TxRecord> {
 /** GEN has 18 decimals, so amounts are handled as base-unit integers. */
 const GEN_UNIT = BigInt(10) ** BigInt(18);
 
+/**
+ * Convert a GEN amount typed by the user into base units (wei).
+ * One convention for every method argument and for the attached value:
+ * assessment amount, loan amount, funding amount and disbursement amount
+ * are all wei; only this entry point and `formatBaseUnits` deal in GEN.
+ * Accepts integers and decimals ("1", "0.01"); throws on malformed input.
+ */
+export function toBaseUnits(gen: string): bigint {
+  const trimmed = gen.trim();
+  if (!/^\d+(\.\d+)?$|^\.\d+$/.test(trimmed)) {
+    throw new Error(`Invalid GEN amount: "${gen}"`);
+  }
+  const [wholePart, fracPart = ''] = trimmed.split('.');
+  const frac = (fracPart + '0'.repeat(18)).slice(0, 18);
+  return BigInt(wholePart || '0') * GEN_UNIT + BigInt(frac);
+}
+
+/** Render base units (wei) as a human-readable GEN string. */
+export function formatBaseUnits(value: bigint | string | number): string {
+  const wei = BigInt(value);
+  const whole = wei / GEN_UNIT;
+  const frac = (wei % GEN_UNIT).toString().padStart(18, '0').replace(/0+$/, '');
+  return frac ? `${whole}.${frac}` : `${whole}`;
+}
+
 export interface WriteOutcome {
   hash: string;
   ok: boolean;
@@ -420,7 +445,11 @@ async function sendContractCall(
   }
 }
 
-/** Consensus-driven credit assessment: runs the LLM comparative judgement. */
+/**
+ * Consensus-driven credit assessment: runs the LLM comparative judgement.
+ * `amount` is in base units (wei); the contract converts it to GEN for the
+ * validator prompt, so the same convention holds end to end.
+ */
 export async function writeAssessCredit(
   provider: EIP1193Provider,
   account: string,
@@ -440,7 +469,7 @@ export async function writeCreateBorrower(
   return sendContractCall(provider, account, { functionName: 'create_borrower', args: [borrower, reputation] });
 }
 
-/** Open a new loan proposal for a borrower. */
+/** Open a new loan proposal for a borrower. `amount` is in base units (wei). */
 export async function writeCreateLoan(
   provider: EIP1193Provider,
   account: string,
@@ -454,7 +483,12 @@ export async function writeCreateLoan(
   });
 }
 
-/** Lock GEN into escrow against a loan request (under-collateralized funding). */
+/**
+ * Lock GEN into escrow against a loan request (under-collateralized funding).
+ * `amount` is in base units (wei) and is attached verbatim as `msg.value` —
+ * the contract requires `gl.message.value == amount`, so both sides of the
+ * comparison share the same unit.
+ */
 export async function writeFundLoan(
   provider: EIP1193Provider,
   account: string,
@@ -464,11 +498,11 @@ export async function writeFundLoan(
   return sendContractCall(provider, account, {
     functionName: 'fund_loan',
     args: [loanId, amount],
-    value: amount * GEN_UNIT,
+    value: amount,
   });
 }
 
-/** Release escrowed GEN to the borrower after funding. */
+/** Release escrowed GEN to the borrower after funding. `amount` is in wei. */
 export async function writeDisburseLoan(
   provider: EIP1193Provider,
   account: string,

@@ -1,6 +1,7 @@
 """Direct mode tests for UnderCollaterizedLending contract."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -603,3 +604,156 @@ def test_consensus_verdict_is_the_lending_switch(direct_vm, direct_deploy, direc
     parsed = json.loads(contract.get_credit_assessment(borrower))
     assert parsed["approved"] is True
     assert borrower in contract.get_credit_assessments()
+
+
+# ------------------------------------------------------------------ #
+# Steward follow-up: one base-unit convention across the whole flow
+# ------------------------------------------------------------------ #
+
+GEN = 10**18
+
+
+def to_base_units(gen: str) -> int:
+    """Mirror of the frontend ``toBaseUnits`` (lib/genlayer.ts).
+
+    The UI is the only place that ever sees human GEN strings; every contract
+    method argument and the attached ``msg.value`` are base units (wei).
+    """
+    import re
+
+    if not re.fullmatch(r"\d+(\.\d+)?|\.\d+", gen.strip()):
+        raise ValueError(f'Invalid GEN amount: "{gen}"')
+    whole, _, frac = gen.strip().partition(".")
+    return int(whole or "0") * GEN + int((frac + "0" * 18)[:18])
+
+
+def test_to_base_units_matches_frontend_conversion():
+    """The GEN->wei helper used by the UI must agree with on-chain base units."""
+    assert to_base_units("1") == 10**18
+    assert to_base_units("0.01") == 10**16
+    assert to_base_units(".5") == 5 * 10**17
+    assert to_base_units("100") == 100 * 10**18
+    assert to_base_units("0") == 0
+    with pytest.raises(ValueError):
+        to_base_units("abc")
+    with pytest.raises(ValueError):
+        to_base_units("1.2.3")
+
+
+def test_end_to_end_assessment_to_disbursement_in_base_units(direct_vm, direct_deploy, direct_alice):
+    """Corrected flow: assessment -> creation -> funding -> disbursement all in wei.
+
+    One convention, end to end: the amount the user types as ``"1"`` GEN is
+    converted once at the UI boundary (``toBaseUnits``) and then travels as
+    ``10**18`` wei through ``create_loan``, ``assess_credit``, ``fund_loan``
+    (both the argument *and* the attached value) and ``disburse_loan`` — so the
+    contract's ``gl.message.value != amount`` check passes instead of reverting.
+    """
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+    borrower = contract._sender()
+    amount = to_base_units("1")  # what the UI sends for an input of "1" GEN
+
+    # borrower profile: reputation 800 satisfies the consensus rubric (>= 600)
+    contract.create_borrower(borrower, 800)
+
+    # 1) loan creation in base units
+    loan_id = contract.create_loan(borrower, amount, 500)
+    assert contract.get_loan(loan_id)["amount"] == amount
+
+    # 2) consensus assessment in base units (prompt still shows human GEN)
+    seen_prompts = []
+    original_match = direct_vm._match_llm_mock
+    direct_vm._match_llm_mock = lambda p: (seen_prompts.append(p), original_match(p))[1]
+    try:
+        direct_vm.mock_llm(r".*risk validator.*", '{"approved": true}')
+        decision = contract.assess_credit(borrower, amount)
+    finally:
+        direct_vm._match_llm_mock = original_match
+
+    assert json.loads(decision)["amount"] == amount
+    assert "1 GEN and 0 milli-GEN" in seen_prompts[0], seen_prompts[0]
+    assert f"{amount} GEN" not in seen_prompts[0]
+
+    # 3) funding: argument and attached value share the same wei figure
+    direct_vm.value = amount
+    assert str(contract.fund_loan(loan_id, amount)) == "FUNDED"
+    loan = contract.get_loan(loan_id)
+    assert loan["status"] == "funded"
+    assert loan["deposited"] == amount
+
+    # 4) disbursement releases exactly the escrowed base units
+    direct_vm.value = 0
+    assert str(contract.disburse_loan(loan_id, amount)) == "DISBURSED"
+    loan = contract.get_loan(loan_id)
+    assert loan["status"] == "active"
+    assert loan["deposited"] == amount
+
+    # 5) lifecycle closes in the same unit
+    contract.repay_loan(loan_id)
+    assert contract.get_loan(loan_id)["status"] == "repaid"
+
+    # the whole ledger is base units all the way through
+    loans = contract.get_loans()
+    assert loans[loan_id]["amount"] == amount
+    assert loans[loan_id]["deposited"] == amount
+
+
+def test_fund_loan_whole_gen_args_with_wei_value_reverts(direct_vm, direct_deploy, direct_alice):
+    """Regression for the reported bug: mixed units must never fund a loan.
+
+    Passing a whole-GEN method argument (``1``) while attaching a wei-scaled
+    value (``10**18``) is exactly the mismatch that made the old frontend
+    revert with WRONG_VALUE; the contract keeps rejecting any such pair.
+    """
+    contract = direct_deploy("contracts/UnderCollaterizedLending.py")
+    direct_vm.sender = direct_alice
+    borrower = contract._sender()
+    amount = to_base_units("1")
+    contract.create_borrower(borrower, 800)
+    loan_id = contract.create_loan(borrower, amount, 500)
+    direct_vm.mock_llm(r".*risk validator.*", '{"approved": true}')
+    contract.assess_credit(borrower, amount)
+
+    # whole-GEN argument + wei-scaled attached value -> WRONG_VALUE
+    direct_vm.value = amount
+    with pytest.raises(Exception) as excinfo:
+        contract.fund_loan(loan_id, 1)
+    _assert_user_error(excinfo.value, "WRONG_VALUE")
+
+    # the mirror mistake (wei argument + GEN-scaled value) is refused too
+    direct_vm.value = 1  # a whole-GEN value attached against a wei argument
+    with pytest.raises(Exception) as excinfo:
+        contract.fund_loan(loan_id, amount)
+    _assert_user_error(excinfo.value, "WRONG_VALUE")
+
+    # the loan is untouched: still pending, no escrow locked
+    loan = contract.get_loan(loan_id)
+    assert loan["status"] == "pending"
+    assert loan["deposited"] == 0
+
+
+def test_frontend_source_uses_single_base_unit_convention():
+    """The shipped UI source must keep one convention: GEN is converted once.
+
+    Guards the steward-reported regression directly in source: ``fund_loan``
+    attaches ``amount`` verbatim (never re-scales it), and every handler
+    converts the typed GEN string through ``toBaseUnits`` before it reaches a
+    method argument.
+    """
+    root = Path(__file__).resolve().parents[2]
+    lib = (root / "frontend" / "lib" / "genlayer.ts").read_text(encoding="utf-8")
+    actions = (root / "frontend" / "components" / "LoanActions.tsx").read_text(encoding="utf-8")
+    dashboard = (root / "frontend" / "app" / "dashboard" / "page.tsx").read_text(encoding="utf-8")
+
+    # fund_loan: value is the wei argument itself, not a second scaling
+    assert "value: amount * GEN_UNIT" not in lib
+    assert "export function toBaseUnits" in lib
+    assert "export function formatBaseUnits" in lib
+
+    # every amount that reaches a contract method goes through toBaseUnits
+    assert actions.count("toBaseUnits(amount)") == 4  # assess, create, fund, disburse
+    # and wei read back from chain is rendered through formatBaseUnits
+    assert "formatBaseUnits(decision.amount)" in actions
+    assert "formatBaseUnits(decision.amount ?? 0)" in dashboard
+    assert "formatBaseUnits(loan.amount ?? 0)" in dashboard
